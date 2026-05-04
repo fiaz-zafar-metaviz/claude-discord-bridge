@@ -1,0 +1,18 @@
+{
+  "name": "claude-discord-bridge",
+  "version": "1.0.0",
+  "description": "Discord bot that bridges your Discord channel to Claude Code with full file/bash/edit access. Send Discord messages (text + voice) and Claude executes on your project.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
