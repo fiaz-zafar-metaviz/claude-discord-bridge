@@ -235,11 +235,33 @@ function chunkText(text, size = 1900) {
   return chunks;
 }
 
+function ackMessageFor(content) {
+  const { model } = pickModel(content);
+  const lower = content.toLowerCase();
+
+  const willBeSlow = model !== CLAUDE_DEFAULT_MODEL || content.length > 280;
+  const isAction = /(\bfix\b|\bbuild\b|\bdeploy\b|\brefactor\b|\bimplement\b|\bcreate\b|\bchala\b|\brun\b|\bdebug\b|\bmigrate\b|\binstall\b|\bupgrade\b|\boptimize\b|\bscan\b|\baudit\b|\breview\b|\bresearch\b|\bsearch\b|\bcheck\b|\binvestigate\b)/i.test(lower);
+
+  if (!willBeSlow && !isAction) return null;
+
+  if (/refactor|migrate|build|deploy|audit|review/i.test(lower)) return 'on it. this looks substantial, give me a minute or two...';
+  if (/fix|debug/i.test(lower)) return 'looking into it...';
+  if (/research|search|investigate|scan/i.test(lower)) return 'researching now...';
+  if (/install|upgrade/i.test(lower)) return 'installing...';
+  if (/run|start/i.test(lower)) return 'starting it up...';
+  return 'on it...';
+}
+
 async function processQueue(client) {
   if (busy || queue.length === 0) return;
   busy = true;
   const { message, content } = queue.shift();
   try {
+    const ack = ackMessageFor(content);
+    if (ack) {
+      await message.reply(ack).catch(() => {});
+    }
+
     await message.channel.sendTyping();
     const typingInterval = setInterval(() => {
       message.channel.sendTyping().catch(() => {});
