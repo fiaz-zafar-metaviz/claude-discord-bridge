@@ -17,7 +17,12 @@ const {
   CLAUDE_PERMISSION_MODE = 'bypassPermissions',
   CLAUDE_DEFAULT_MODEL = 'haiku',
   CLAUDE_HEAVY_MODEL = 'sonnet',
+  AGENT_MODE = 'true',
+  PING_AFTER_MS = '60000',
 } = process.env;
+
+const IS_AGENT_MODE = AGENT_MODE.toLowerCase() === 'true';
+const PING_AFTER = parseInt(PING_AFTER_MS) || 60000;
 
 const HEAVY_KEYWORDS = [
   'refactor', 'debug', 'fix bug', 'implement', 'design', 'architect',
@@ -92,6 +97,16 @@ The user's CLAUDE.md (if present in project root) and project memory at ~/.claud
 - Web: WebFetch (specific URLs), WebSearch (latest info, version checks, library docs, error lookups).
 - MCP servers: whatever is configured in user's .mcp.json or project mcp config.
 - Skills: any installed Claude Code skills (/init, /review, /security-review, simplify, etc.).
+
+==== AGENT MODE (CRITICAL — ${IS_AGENT_MODE ? 'ENABLED' : 'OFF'}) ====
+${IS_AGENT_MODE ? `User is OFTEN AWAY FROM PC. You have FULL PC CONTROL via Bash. Behave like an autonomous remote agent:
+- NEVER tell user "you have to install X" or "you do Y on your PC". You install it / do it yourself.
+- For missing CLI tools on Windows: try in order \`choco install X\`, \`scoop install X\`, \`winget install X\`, \`npm i -g X\`, \`pip install X\`. On Mac: brew. On Linux: apt/yum/dnf. ONLY ask user if all fail.
+- For Windows GUI tasks (open browser, click button), use PowerShell automation: \`Start-Process\`, \`Add-Type -AssemblyName System.Windows.Forms\`, \`SendKeys\`.
+- For browser automation, use playwright (\`npx playwright codegen\` to record, or write a script).
+- For screenshots, use OS-native tools (Windows: PowerShell + System.Drawing; Mac: \`screencapture\`; Linux: \`scrot\`).
+- Don't ask permission for installs or file changes or system tweaks. Just do, then briefly report.
+- If a task takes 60s+, the bot itself will @ping the user when done so they get a phone notification.` : 'Agent mode disabled. Be more conservative, ask for permission on installs and system changes.'}
 
 ==== HOW TO BEHAVE ====
 - Short Discord prompts equal full intent. Interpret like a senior dev would. Don't ask trivial clarifying questions.
@@ -267,13 +282,20 @@ async function processQueue(client) {
       message.channel.sendTyping().catch(() => {});
     }, 8000);
 
+    const startedAt = Date.now();
     const reply = await runClaude(content);
+    const elapsed = Date.now() - startedAt;
     clearInterval(typingInterval);
 
     const text = (reply || '(empty response)').trim();
     const chunks = chunkText(text);
-    for (const chunk of chunks) {
-      await message.reply(chunk);
+
+    const shouldPing = elapsed > PING_AFTER;
+    const mention = shouldPing ? `<@${ALLOWED_USER_ID}> ` : '';
+
+    for (let i = 0; i < chunks.length; i++) {
+      const prefix = (i === 0 && mention) ? mention : '';
+      await message.reply(prefix + chunks[i]);
     }
   } catch (err) {
     console.error(err);
@@ -298,6 +320,32 @@ client.once(Events.ClientReady, (c) => {
   console.log(`Listening on channel ${ALLOWED_CHANNEL_ID} from user ${ALLOWED_USER_ID}`);
 });
 
+async function downloadImageAttachments(message) {
+  const imageAttachments = message.attachments?.filter?.((a) => (a.contentType || '').startsWith('image/')) || [];
+  if (imageAttachments.size === 0) return [];
+
+  const downloads = [];
+  const dropDir = path.join(CLAUDE_PROJECT_DIR, '.discord-uploads');
+  if (!fs.existsSync(dropDir)) fs.mkdirSync(dropDir, { recursive: true });
+
+  for (const att of imageAttachments.values()) {
+    try {
+      const res = await fetch(att.url);
+      if (!res.ok) continue;
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ext = path.extname(att.name) || '.png';
+      const filename = `discord-img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+      const fullPath = path.join(dropDir, filename);
+      fs.writeFileSync(fullPath, buf);
+      downloads.push({ path: fullPath, relative: `.discord-uploads/${filename}`, name: att.name });
+      console.log(`[image] saved ${att.name} -> ${fullPath}`);
+    } catch (e) {
+      console.error('[image] download error:', e);
+    }
+  }
+  return downloads;
+}
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.channelId !== ALLOWED_CHANNEL_ID) return;
@@ -305,6 +353,15 @@ client.on(Events.MessageCreate, async (message) => {
 
   let content = message.content?.trim() || '';
   const audioAttachment = message.attachments?.find?.((a) => (a.contentType || '').startsWith('audio/'));
+
+  // Image attachments
+  const images = await downloadImageAttachments(message);
+  if (images.length > 0) {
+    const imageList = images.map((img, i) => `${i + 1}. ${img.relative} (${img.name})`).join('\n');
+    const imageNote = `[User attached ${images.length} image(s) saved to project at .discord-uploads/. Use Read tool to view them:\n${imageList}]`;
+    content = content ? `${content}\n\n${imageNote}` : imageNote;
+    await message.react('🖼️').catch(() => {});
+  }
 
   if (audioAttachment) {
     try {
