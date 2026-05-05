@@ -61,6 +61,8 @@ for (const [k, v] of Object.entries({ DISCORD_TOKEN, ALLOWED_USER_ID, ALLOWED_CH
 const SESSION_FILE = path.join(__dirname, '.claude-session-id');
 const STARTED_FILE = path.join(__dirname, '.claude-session-started');
 const SCHEDULES_FILE = path.join(__dirname, 'schedules.json');
+const TTS_STATE_FILE = path.join(__dirname, '.tts-enabled');
+const TTS_VOICE = process.env.TTS_VOICE || 'en-US-AriaNeural';
 
 function getSessionId() {
   if (fs.existsSync(SESSION_FILE)) {
@@ -299,6 +301,18 @@ async function processQueue(client) {
       const prefix = (i === 0 && mention) ? mention : '';
       await message.reply(prefix + chunks[i]);
     }
+
+    // TTS audio reply if enabled
+    if (isTtsEnabled() && text && text.length > 5) {
+      try {
+        const audioFile = await generateTts(text);
+        const att = new AttachmentBuilder(audioFile).setName('reply.mp3');
+        await message.reply({ files: [att] }).catch(() => {});
+        try { fs.rmSync(audioFile, { force: true }); } catch {}
+      } catch (e) {
+        console.error('[tts] error:', e);
+      }
+    }
   } catch (err) {
     console.error(err);
     await message.reply(`error: ${err.message.slice(0, 1800)}`);
@@ -368,7 +382,33 @@ function loadAndStartAllSchedules(client) {
   console.log(`[cron] loaded ${started}/${all.length} schedules`);
 }
 
-// ---------- Screenshot (Windows) ----------
+// ---------- TTS (text-to-speech via edge-tts) ----------
+function isTtsEnabled() {
+  return fs.existsSync(TTS_STATE_FILE);
+}
+function setTtsEnabled(on) {
+  if (on) fs.writeFileSync(TTS_STATE_FILE, '1');
+  else if (fs.existsSync(TTS_STATE_FILE)) fs.rmSync(TTS_STATE_FILE);
+}
+async function generateTts(text) {
+  const tmpFile = path.join(os.tmpdir(), `tts-${Date.now()}.mp3`);
+  return new Promise((resolve, reject) => {
+    const py = spawn('python', [path.join(__dirname, 'tts.py'), tmpFile, text, TTS_VOICE], {
+      shell: true,
+      windowsHide: true,
+    });
+    let stderr = '';
+    py.stderr.on('data', (d) => (stderr += d.toString()));
+    py.on('close', (code) => {
+      if (code !== 0 || !fs.existsSync(tmpFile)) {
+        return reject(new Error(`tts failed (${code}): ${stderr.slice(0, 300)}`));
+      }
+      resolve(tmpFile);
+    });
+  });
+}
+
+// ---------- Screenshot (Windows/Mac/Linux) ----------
 async function takeScreenshot() {
   const tmpFile = path.join(os.tmpdir(), `screenshot-${Date.now()}.png`);
   const platform = process.platform;
@@ -541,18 +581,35 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
+  // Voice (TTS) toggle
+  if (content === '!voice on' || content === '!voice') {
+    setTtsEnabled(true);
+    await message.reply(`🔊 voice replies ON. each Claude reply will also come as audio (voice: \`${TTS_VOICE}\`).`);
+    return;
+  }
+  if (content === '!voice off') {
+    setTtsEnabled(false);
+    await message.reply('🔇 voice replies OFF.');
+    return;
+  }
+  if (content === '!voice status') {
+    await message.reply(`voice: ${isTtsEnabled() ? '🔊 ON' : '🔇 OFF'} (${TTS_VOICE})`);
+    return;
+  }
+
   if (content === '!help') {
     await message.reply([
       '**Commands:**',
       '`!reset` - clear session, start fresh',
       '`!screenshot` / `!ss` - capture and send PC screenshot',
+      '`!voice on/off/status` - toggle TTS audio replies',
       '`!schedule <cron> | <task>` - schedule recurring task',
       '`!schedules` - list scheduled tasks',
       '`!unschedule <id>` - remove a scheduled task',
       '`!h <prompt>` / `!s <prompt>` / `!o <prompt>` - force model',
       '`!help` - this message',
       '',
-      'Anything else gets sent to Claude. Voice and images supported.',
+      'Anything else gets sent to Claude. Voice messages, images, and TTS audio replies supported.',
     ].join('\n'));
     return;
   }
