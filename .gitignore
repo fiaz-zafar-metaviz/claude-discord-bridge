@@ -3,6 +3,7 @@ node_modules/
 .env.local
 .claude-session-id
 .claude-session-started
+schedules.json
 *.log
 .DS_Store
 *.tmp

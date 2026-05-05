@@ -1,11 +1,12 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits, Events, AttachmentBuilder } from 'discord.js';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import cron from 'node-cron';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -59,6 +60,7 @@ for (const [k, v] of Object.entries({ DISCORD_TOKEN, ALLOWED_USER_ID, ALLOWED_CH
 
 const SESSION_FILE = path.join(__dirname, '.claude-session-id');
 const STARTED_FILE = path.join(__dirname, '.claude-session-started');
+const SCHEDULES_FILE = path.join(__dirname, 'schedules.json');
 
 function getSessionId() {
   if (fs.existsSync(SESSION_FILE)) {
@@ -318,7 +320,90 @@ const client = new Client({
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   console.log(`Listening on channel ${ALLOWED_CHANNEL_ID} from user ${ALLOWED_USER_ID}`);
+  loadAndStartAllSchedules(client);
 });
+
+// ---------- Scheduled tasks (cron) ----------
+function loadSchedules() {
+  if (!fs.existsSync(SCHEDULES_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(SCHEDULES_FILE, 'utf8')); } catch { return []; }
+}
+function saveSchedules(list) {
+  fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(list, null, 2));
+}
+
+const activeJobs = new Map();
+
+function startSchedule(client, schedule) {
+  if (!cron.validate(schedule.cronExpr)) {
+    console.error(`[cron] invalid expr: ${schedule.cronExpr}`);
+    return false;
+  }
+  const task = cron.schedule(schedule.cronExpr, async () => {
+    console.log(`[cron] firing schedule ${schedule.id}: ${schedule.task}`);
+    try {
+      const channel = await client.channels.fetch(ALLOWED_CHANNEL_ID);
+      if (!channel) return;
+      await channel.send(`<@${ALLOWED_USER_ID}> ⏰ scheduled task fired: \`${schedule.task}\``);
+      const reply = await runClaude(schedule.task);
+      const text = (reply || '(empty)').trim();
+      const chunks = chunkText(text);
+      for (const chunk of chunks) {
+        await channel.send(chunk);
+      }
+    } catch (e) {
+      console.error('[cron] error firing:', e);
+    }
+  });
+  activeJobs.set(schedule.id, task);
+  return true;
+}
+
+function loadAndStartAllSchedules(client) {
+  const all = loadSchedules();
+  let started = 0;
+  for (const s of all) {
+    if (startSchedule(client, s)) started++;
+  }
+  console.log(`[cron] loaded ${started}/${all.length} schedules`);
+}
+
+// ---------- Screenshot (Windows) ----------
+async function takeScreenshot() {
+  const tmpFile = path.join(os.tmpdir(), `screenshot-${Date.now()}.png`);
+  const platform = process.platform;
+
+  return new Promise((resolve, reject) => {
+    let proc;
+    if (platform === 'win32') {
+      const psScript = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$bmp.Save('${tmpFile.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose()
+$bmp.Dispose()
+`.trim();
+      proc = spawn('powershell', ['-NoProfile', '-Command', psScript], { windowsHide: true });
+    } else if (platform === 'darwin') {
+      proc = spawn('screencapture', ['-x', tmpFile]);
+    } else {
+      // Linux: try scrot first, fallback to gnome-screenshot
+      proc = spawn('sh', ['-c', `scrot "${tmpFile}" || gnome-screenshot -f "${tmpFile}"`]);
+    }
+    let stderr = '';
+    proc.stderr?.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', (code) => {
+      if (code !== 0 || !fs.existsSync(tmpFile)) {
+        return reject(new Error(`screenshot failed (${code}): ${stderr.slice(0, 300)}`));
+      }
+      resolve(tmpFile);
+    });
+  });
+}
 
 async function downloadImageAttachments(message) {
   const imageAttachments = message.attachments?.filter?.((a) => (a.contentType || '').startsWith('image/')) || [];
@@ -394,6 +479,82 @@ client.on(Events.MessageCreate, async (message) => {
     fs.rmSync(STARTED_FILE, { force: true });
     await message.reply('session reset. next message starts fresh.');
     process.exit(0);
+  }
+
+  // Screenshot command
+  if (content === '!screenshot' || content === '!ss') {
+    try {
+      await message.reply('taking screenshot...');
+      const file = await takeScreenshot();
+      const att = new AttachmentBuilder(file).setName('screenshot.png');
+      await message.reply({ files: [att] });
+      try { fs.rmSync(file, { force: true }); } catch {}
+    } catch (e) {
+      await message.reply(`screenshot failed: ${e.message.slice(0, 300)}`);
+    }
+    return;
+  }
+
+  // Schedule commands
+  if (content.startsWith('!schedule ')) {
+    const rest = content.slice('!schedule '.length).trim();
+    const sep = rest.indexOf('|');
+    if (sep < 0) {
+      await message.reply('usage: `!schedule <cron-expr> | <task>`\nexample: `!schedule 0 9 * * * | check git status and yesterday commits summary`\ncron format: minute hour day month weekday (e.g. `0 9 * * *` = 9am daily)');
+      return;
+    }
+    const cronExpr = rest.slice(0, sep).trim();
+    const task = rest.slice(sep + 1).trim();
+    if (!cron.validate(cronExpr)) {
+      await message.reply(`invalid cron expression: \`${cronExpr}\``);
+      return;
+    }
+    const all = loadSchedules();
+    const id = (Math.max(0, ...all.map(s => s.id || 0)) + 1);
+    const schedule = { id, cronExpr, task, createdAt: new Date().toISOString() };
+    all.push(schedule);
+    saveSchedules(all);
+    startSchedule(client, schedule);
+    await message.reply(`✅ scheduled #${id}: \`${cronExpr}\` -> ${task}`);
+    return;
+  }
+
+  if (content === '!schedules') {
+    const all = loadSchedules();
+    if (all.length === 0) { await message.reply('no scheduled tasks.'); return; }
+    const list = all.map(s => `**#${s.id}** \`${s.cronExpr}\` -> ${s.task}`).join('\n');
+    await message.reply(`scheduled tasks:\n${list}\n\nremove with \`!unschedule <id>\``);
+    return;
+  }
+
+  const unscheduleMatch = content.match(/^!unschedule\s+(\d+)$/);
+  if (unscheduleMatch) {
+    const id = parseInt(unscheduleMatch[1]);
+    const all = loadSchedules();
+    const idx = all.findIndex(s => s.id === id);
+    if (idx < 0) { await message.reply(`schedule #${id} not found.`); return; }
+    const job = activeJobs.get(id);
+    if (job) { job.stop(); activeJobs.delete(id); }
+    all.splice(idx, 1);
+    saveSchedules(all);
+    await message.reply(`✅ removed schedule #${id}`);
+    return;
+  }
+
+  if (content === '!help') {
+    await message.reply([
+      '**Commands:**',
+      '`!reset` - clear session, start fresh',
+      '`!screenshot` / `!ss` - capture and send PC screenshot',
+      '`!schedule <cron> | <task>` - schedule recurring task',
+      '`!schedules` - list scheduled tasks',
+      '`!unschedule <id>` - remove a scheduled task',
+      '`!h <prompt>` / `!s <prompt>` / `!o <prompt>` - force model',
+      '`!help` - this message',
+      '',
+      'Anything else gets sent to Claude. Voice and images supported.',
+    ].join('\n'));
+    return;
   }
 
   console.log(`[msg] from ${message.author.tag}: ${content.slice(0, 100)}`);
